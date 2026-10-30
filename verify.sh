@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Checks the C45 certificate. Needs a C++20 compiler and Python 3.10+ (standard library only).
-#   ./verify.sh --stored        # check the stored histograms in certs/ (seconds)
+# Checks the C45 certificates. Needs a C++20 compiler and Python 3.10+ (standard library only).
+#   ./verify.sh --stored        # check the stored histograms in certs/ (about 20 s)
 #   ./verify.sh cert-51.json    # rebuild the 51-prime histogram and check it (~17 min, THREADS=2)
-#   ./verify.sh                 # rebuild the 52-prime histogram and check it (~1.5 h, THREADS=2, ~3.6 GB)
+#   ./verify.sh                 # rebuild the 54-prime histogram and check it (~1 h, THREADS=2, ~4 GB)
+#   ./verify.sh cert-52.json    # rebuild the 52-prime histogram and check it (~1.5 h, THREADS=2)
 set -euo pipefail
 cd "$(dirname "$0")"
 if [[ "${1:-}" == "--stored" ]]; then
+    python3 verify_cert.py certs/c45-54/cert.json certs/c45-54/seed_histogram.txt.gz --self-test
     for c in certs/c45-52 certs/c45-51; do
-        python3 verify_cert.py "$c/cert.json" "$c/seed_histogram.txt" --self-test
+        python3 verify_cert.py "$c/cert.json" "$c/seed_histogram.txt"
     done
     exit 0
 fi

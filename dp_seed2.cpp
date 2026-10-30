@@ -16,6 +16,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstring>
 #include <cstdint>
 #include <functional>
 #include <iostream>
@@ -47,7 +50,10 @@ static int THREADS = 1;
 static int SPLIT = 0;  // >0: first SPLIT primes form side A
 static int STREAM = 0;  // >0: last two groups streamed in this many passes
 static int GROUPS_G = 0;
-static bool HIER = false;  // --hier: groups after '|' are A groups (orders prime to 3)  // >0: group-product mode over Z/GROUPS_G, groups separated by '/'
+static bool HIER = false;
+static bool HIER2 = false;
+static std::string SIGMA_CACHE;
+static long long CUT = -1, CAP = 0;  // --hier: groups after '|' are A groups (orders prime to 3)  // >0: group-product mode over Z/GROUPS_G, groups separated by '/'
 
 static std::string u128s(u128 x) {
     if (x == 0) return "0";
@@ -79,6 +85,11 @@ static inline U256 mul128(u128 a, u128 b) {
     return r;
 }
 static inline void add_mul(U256& acc, u128 a, u128 b) { add256(acc, mul128(a, b)); }
+static inline U256 mul_big(U256 a, u128 b) {  // a * b, result assumed below 2^256
+    U256 r = mul128(a.lo, b);
+    r.hi += a.hi * b;
+    return r;
+}
 static U256 mul_small(U256 a, uint64_t m) {
     // a * m, m < 2^64 (no overflow past 256 bits assumed)
     U256 lo = mul128(a.lo, m);
@@ -871,6 +882,341 @@ static Hist hier_run(std::vector<std::vector<int>> const& Bg, std::vector<std::v
     return out;
 }
 
+// ---------------------------------------------------------------- hier2: cached sigma law, fast pairing
+// Same decomposition as hier_run (nu = <sigma, beta> on Z/4), different pairing:
+//  * the sigma law (B side) is built once, merged across threads, sorted by entry sum and can be
+//    cached on disk (--sigma-cache), since it does not depend on the A groups;
+//  * pairs are enumerated A element outer, sigma inner, grouped by A weight: Q[nu] += W_sigma (u128),
+//    one 256-bit multiply per (weight class, bin) instead of one per pair;
+//  * optional cut (--cut C): for an A element beta, every sigma with entry sum > C / min(beta) has
+//    nu > C, so those pairs are not enumerated; their exact count, sum of nu and sum of nu^2 come from
+//    suffix sums over the entry sum. Pairs enumerated with nu > cap go to the same aggregate. The
+//    output then holds exact bins for nu <= cap and one aggregate line for pairs with nu > C.
+struct SigmaLaw {
+    std::vector<uint32_t> key;  // 4 x u8, entry s in bits 8s..8s+7
+    std::vector<u128> w;
+    U256 M;                     // total weight (= M_B)
+    long long T = 0;            // period of the B side
+    std::vector<int> primes;    // B primes, for the cache check
+};
+static inline int s_ent(uint32_t k, int s) { return int((k >> (8 * s)) & 255); }
+static inline int s_sum(uint32_t k) { return s_ent(k, 0) + s_ent(k, 1) + s_ent(k, 2) + s_ent(k, 3); }
+
+static SigmaLaw sigma_law(std::vector<std::vector<int>> const& Bg, bool trace) {
+    const int g = 12, h = 4;
+    const auto ps = group_perms(g), ps4 = group_perms(h);
+    SigmaLaw S;
+    long long T = g, privprod = 1;
+    std::vector<std::vector<std::pair<GV, u128>>> be;
+    S.M.lo = 1;
+    for (auto const& G : Bg) {
+        Hist hg = run(G, false, g);
+        T = std::lcm(T, (long long)hg.T);
+        privprod *= hg.T / g;
+        for (int q : G) { S.M = mul_small(S.M, uint64_t(q)); S.primes.push_back(q); }
+        be.push_back(expand_orbits(hg, g, ps));
+        if (trace) std::cerr << "B group L=" << hg.T << ": " << be.back().size() << " elements" << std::endl;
+    }
+    if (T != g * privprod) throw std::runtime_error("B private parts not independent");
+    if (T / h > 255) throw std::runtime_error("sigma entries do not fit in 8 bits");
+    S.T = T;
+    const size_t K = Bg.size();
+    GMap st;
+    for (auto const& [v, w] : be[0]) st[gcanon(v, g, ps)] += w;
+    for (size_t k = 1; k + 1 < K; ++k) {
+        GMap nx;
+        for (auto const& [a, wa] : st)
+            for (auto const& [b, wb] : be[k]) {
+                GV p{};
+                for (int c = 0; c < g; ++c) p[c] = uint16_t(a[c] * b[c]);
+                nx[gcanon(p, g, ps)] += wa * wb;
+            }
+        st.swap(nx);
+        if (trace) std::cerr << "B product " << k + 1 << ": states=" << st.size() << std::endl;
+    }
+    std::vector<std::pair<GV, u128>> sv(st.begin(), st.end());
+    GMap().swap(st);
+    auto const& last = be[K - 1];
+    const size_t NL = last.size();
+    std::vector<std::vector<uint16_t>> LB(g, std::vector<uint16_t>(NL));
+    for (size_t j = 0; j < NL; ++j) for (int c = 0; c < g; ++c) LB[c][j] = last[j].first[c];
+    auto canon4 = [&](uint32_t key) {
+        uint32_t best = ~0u;
+        for (auto const& p : ps4) {
+            uint8_t e[4];
+            for (int s = 0; s < h; ++s) e[p[s]] = uint8_t(s_ent(key, s));
+            uint32_t be2 = (uint32_t(e[0]) << 24) | (uint32_t(e[1]) << 16) | (uint32_t(e[2]) << 8) | e[3];
+            best = std::min(best, be2);
+        }
+        // back to little-endian slots: entry 0 in the low byte
+        return ((best >> 24) & 255) | (((best >> 16) & 255) << 8) | (((best >> 8) & 255) << 16) | ((best & 255) << 24);
+    };
+    std::vector<std::unordered_map<uint32_t, u128>> maps(THREADS);
+    auto fold = [&](int tid) {
+        std::unordered_map<uint32_t, u128> raw;
+        auto& o = maps[tid];
+        std::vector<uint32_t> part(h * NL);
+        for (size_t i = tid; i < sv.size(); i += THREADS) {
+            auto const& [a, wa] = sv[i];
+            std::fill(part.begin(), part.end(), 0);
+            for (int c = 0; c < g; ++c) {
+                const uint32_t ac = a[c];
+                uint16_t const* lb = LB[c].data();
+                uint32_t* pp = part.data() + size_t(c % h) * NL;
+                for (size_t j = 0; j < NL; ++j) pp[j] += ac * lb[j];
+            }
+            for (size_t j = 0; j < NL; ++j) {
+                uint32_t key = 0;
+                for (int s = 0; s < h; ++s) key |= part[s * NL + j] << (8 * s);
+                raw[key] += wa * last[j].second;
+            }
+            if (raw.size() > RAW_LIMIT) {
+                for (auto const& [k, w] : raw) o[canon4(k)] += w;
+                std::unordered_map<uint32_t, u128>().swap(raw);
+            }
+        }
+        for (auto const& [k, w] : raw) o[canon4(k)] += w;
+    };
+    {
+        std::vector<std::thread> ts;
+        for (int t = 0; t < THREADS; ++t) ts.emplace_back(fold, t);
+        for (auto& t : ts) t.join();
+    }
+    for (int t = 1; t < THREADS; ++t) {
+        for (auto const& [k, w] : maps[t]) maps[0][k] += w;
+        std::unordered_map<uint32_t, u128>().swap(maps[t]);
+    }
+    std::vector<std::pair<uint32_t, u128>> all(maps[0].begin(), maps[0].end());
+    std::unordered_map<uint32_t, u128>().swap(maps[0]);
+    std::sort(all.begin(), all.end(), [](auto const& x, auto const& y) {
+        int a = s_sum(x.first), b = s_sum(y.first);
+        return a != b ? a < b : x.first < y.first;
+    });
+    S.key.reserve(all.size());
+    S.w.reserve(all.size());
+    U256 tot;
+    for (auto const& [k, w] : all) { S.key.push_back(k); S.w.push_back(w); add256(tot, U256{w, 0}); }
+    if (!(tot == S.M)) throw std::runtime_error("sigma law total != M_B");
+    if (trace) std::cerr << "sigma orbits: " << S.key.size() << std::endl;
+    return S;
+}
+
+static void sigma_save(std::string const& path, SigmaLaw const& S) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) throw std::runtime_error("cannot write " + path);
+    const uint64_t n = S.key.size(), np = S.primes.size();
+    std::fwrite("SIGMA02\0", 1, 8, f);
+    std::fwrite(&S.T, 8, 1, f);
+    std::fwrite(&S.M, 32, 1, f);
+    std::fwrite(&np, 8, 1, f);
+    std::fwrite(S.primes.data(), 4, np, f);
+    std::fwrite(&n, 8, 1, f);
+    std::fwrite(S.key.data(), 4, n, f);
+    std::fwrite(S.w.data(), 16, n, f);
+    std::fclose(f);
+}
+
+static bool sigma_load(std::string const& path, SigmaLaw& S, std::vector<int> const& want) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char magic[8];
+    uint64_t n = 0, np = 0;
+    bool ok = std::fread(magic, 1, 8, f) == 8 && std::memcmp(magic, "SIGMA02\0", 8) == 0 &&
+              std::fread(&S.T, 8, 1, f) == 1 && std::fread(&S.M, 32, 1, f) == 1 && std::fread(&np, 8, 1, f) == 1;
+    if (ok) {
+        S.primes.resize(np);
+        ok = std::fread(S.primes.data(), 4, np, f) == np && S.primes == want && std::fread(&n, 8, 1, f) == 1;
+    }
+    if (ok) {
+        S.key.resize(n);
+        S.w.resize(n);
+        ok = std::fread(S.key.data(), 4, n, f) == n && std::fread(S.w.data(), 16, n, f) == n;
+    }
+    std::fclose(f);
+    if (!ok) return false;
+    U256 tot;
+    for (u128 w : S.w) add256(tot, U256{w, 0});
+    U256 M;
+    M.lo = 1;
+    for (int q : want) M = mul_small(M, uint64_t(q));
+    return tot == S.M && S.M == M;
+}
+
+struct Out2 {
+    std::vector<U256> bins;  // nu = 0..cap
+    U256 acnt, am1, am2;     // aggregate over pairs with nu > cut (count, sum nu, sum nu^2)
+    long long cut = -1, cap = 0, T = 0;
+    U256 M;
+    size_t enumerated = 0, pruned = 0;
+};
+
+static Out2 hier2_run(std::vector<std::vector<int>> const& Bg, std::vector<std::vector<int>> const& Ag,
+                      std::string const& cache, long long cut, long long cap_in, bool trace) {
+    const int h = 4;
+    const auto ps4 = group_perms(h);
+    std::vector<int> bprimes;
+    for (auto const& G : Bg) bprimes.insert(bprimes.end(), G.begin(), G.end());
+    SigmaLaw S;
+    if (cache.empty() || !sigma_load(cache, S, bprimes)) {
+        S = sigma_law(Bg, trace);
+        if (!cache.empty()) sigma_save(cache, S);
+    } else if (trace) std::cerr << "sigma law loaded from " << cache << ": " << S.key.size() << " orbits" << std::endl;
+    // A law with 32-bit entries (raw merge, full elements)
+    std::map<std::array<uint32_t, 4>, u128> alaw{{{1, 1, 1, 1}, 1}};
+    long long T = S.T, aprod = 1;
+    U256 M = S.M;
+    for (auto const& G : Ag) {
+        Hist hg = run(G, false, h);
+        if (hg.T % 3 == 0) throw std::runtime_error("A group order divisible by 3");
+        for (int q : G) M = mul_small(M, uint64_t(q));
+        T = std::lcm(T, (long long)hg.T);
+        aprod *= hg.T / h;
+        auto el = expand_orbits(hg, h, ps4);
+        std::map<std::array<uint32_t, 4>, u128> nx;
+        for (auto const& [a, w] : alaw)
+            for (auto const& [b, wb] : el) {
+                std::array<uint32_t, 4> p;
+                for (int s = 0; s < h; ++s) p[s] = a[s] * b[s];
+                nx[p] += w * wb;
+            }
+        alaw.swap(nx);
+        if (trace) std::cerr << "A group L=" << hg.T << ": " << el.size() << " elements, A law " << alaw.size() << std::endl;
+    }
+    if (T != S.T * aprod) throw std::runtime_error("A/B private parts not independent");
+    if (T > (1LL << 40)) throw std::runtime_error("T0 too large");
+    const long long cap = cut < 0 ? T : std::min<long long>(T, cap_in > 0 ? cap_in : cut);
+    // weight classes: one 256-bit multiply per (class, bin)
+    std::map<u128, std::vector<std::array<uint32_t, 4>>> cls;
+    for (auto const& [a, w] : alaw) cls[w].push_back(a);
+    std::map<std::array<uint32_t, 4>, u128>().swap(alaw);
+    std::vector<std::pair<u128, std::vector<std::array<uint32_t, 4>>>> classes;
+    for (auto& [w, v] : cls) classes.emplace_back(w, std::move(v));
+    // suffix sums over entry sum e: sigma with sum >= e
+    const int EMAX = int(4 * (S.T / h));
+    std::vector<u128> P0(EMAX + 2, 0);
+    std::vector<std::array<u128, 4>> P1(EMAX + 2, std::array<u128, 4>{});
+    std::vector<std::array<u128, 10>> P2(EMAX + 2, std::array<u128, 10>{});
+    std::vector<size_t> start(EMAX + 2, S.key.size());  // first index with sum >= e
+    for (size_t i = S.key.size(); i-- > 0;) {
+        const int e = s_sum(S.key[i]);
+        start[e] = i;
+        P0[e] += S.w[i];
+        int k = 0;
+        for (int s = 0; s < h; ++s) {
+            P1[e][s] += S.w[i] * (u128)s_ent(S.key[i], s);
+            for (int t = s; t < h; ++t) P2[e][k++] += S.w[i] * (u128)(s_ent(S.key[i], s) * s_ent(S.key[i], t));
+        }
+    }
+    for (int e = EMAX; e >= 0; --e) {
+        if (start[e] == S.key.size()) start[e] = start[e + 1];
+        P0[e] += P0[e + 1];
+        for (int s = 0; s < h; ++s) P1[e][s] += P1[e + 1][s];
+        for (int k = 0; k < 10; ++k) P2[e][k] += P2[e + 1][k];
+    }
+    if (trace) std::cerr << "pairing: " << S.key.size() << " sigma x " << classes.size() << " weight classes, cut "
+                         << cut << ", cap " << cap << std::endl;
+    struct Acc { std::vector<U256> bins; U256 c, m1, m2; size_t en = 0, pr = 0; };
+    std::vector<Acc> acc(THREADS);
+    std::atomic<size_t> next{0};
+    auto worker = [&](int tid) {
+        Acc& A = acc[tid];
+        A.bins.assign(cap + 1, U256{});
+        std::vector<u128> Q(cap + 1, 0);
+        uint32_t const* key = S.key.data();
+        u128 const* W = S.w.data();
+        for (size_t ci; (ci = next.fetch_add(1)) < classes.size();) {
+            if (trace && tid == 0 && ci % 500 == 0)
+                std::cerr << "class " << ci << "/" << classes.size() << std::endl;
+            const u128 wc = classes[ci].first;
+            long long lo = cap + 1, hi = -1;
+            for (auto const& b : classes[ci].second) {
+                const uint32_t mn = std::min(std::min(b[0], b[1]), std::min(b[2], b[3]));
+                int ecut = EMAX + 1;  // enumerate sigma with sum < ecut
+                if (cut >= 0 && mn > 0) ecut = int(std::min<long long>(EMAX + 1, cut / mn + 1));
+                const size_t iend = start[ecut];
+                // aggregate for the pruned suffix (sum >= ecut, so nu >= mn * ecut > cut)
+                if (iend < S.key.size()) {
+                    U256 c = mul128(P0[ecut], wc), m1, m2;
+                    for (int s = 0; s < h; ++s) add256(m1, mul128(P1[ecut][s], u128(b[s])));
+                    int k = 0;
+                    for (int s = 0; s < h; ++s)
+                        for (int t = s; t < h; ++t) {
+                            const u128 f = u128(b[s]) * b[t] * (s == t ? 1 : 2);
+                            add256(m2, mul128(P2[ecut][k++], f));
+                        }
+                    add256(A.c, c);
+                    add256(A.m1, mul_big(m1, wc));
+                    add256(A.m2, mul_big(m2, wc));
+                    A.pr += S.key.size() - iend;
+                }
+                A.en += iend;
+                const uint32_t b0 = b[0], b1 = b[1], b2 = b[2], b3 = b[3];
+                // enumerated pairs beyond cap: per-element sums, scaled by the class weight below
+                u128 oc = 0;
+                U256 o1, o2;
+                for (size_t i = 0; i < iend; ++i) {
+                    const uint32_t k2 = key[i];
+                    const uint64_t nu = uint64_t(k2 & 255) * b0 + uint64_t((k2 >> 8) & 255) * b1 +
+                                        uint64_t((k2 >> 16) & 255) * b2 + uint64_t(k2 >> 24) * b3;
+                    if ((long long)nu <= cap) {
+                        Q[nu] += W[i];
+                        lo = std::min<long long>(lo, nu);
+                        hi = std::max<long long>(hi, nu);
+                    } else {
+                        oc += W[i];
+                        U256 t = mul128(W[i], nu);  // W < 2^90, nu < 2^40
+                        add256(o1, t);
+                        add256(o2, mul_small(t, nu));
+                    }
+                }
+                if (oc) {
+                    add256(A.c, mul128(oc, wc));
+                    add256(A.m1, mul_big(o1, wc));
+                    add256(A.m2, mul_big(o2, wc));
+                }
+            }
+            for (long long v = std::max(0LL, lo); v <= hi; ++v)
+                if (Q[v]) { add256(A.bins[v], mul128(Q[v], wc)); Q[v] = 0; }
+        }
+    };
+    {
+        std::vector<std::thread> ts;
+        for (int t = 0; t < THREADS; ++t) ts.emplace_back(worker, t);
+        for (auto& t : ts) t.join();
+    }
+    Out2 out;
+    out.cut = cut; out.cap = cap; out.T = T; out.M = M;
+    out.bins.assign(cap + 1, U256{});
+    U256 tot;
+    for (auto const& A : acc) {
+        for (long long v = 0; v <= cap; ++v) add256(out.bins[v], A.bins[v]);
+        add256(out.acnt, A.c); add256(out.am1, A.m1); add256(out.am2, A.m2);
+        out.enumerated += A.en; out.pruned += A.pr;
+    }
+    for (long long v = 0; v <= cap; ++v) add256(tot, out.bins[v]);
+    add256(tot, out.acnt);
+    if (!(tot == M)) throw std::runtime_error("hier2 total != M0");
+    if (trace) std::cerr << "pairs enumerated " << out.enumerated << ", pruned " << out.pruned << std::endl;
+    return out;
+}
+
+static void print_out2(Out2 const& o) {
+    // with a cut, bins in (cut, cap] join the aggregate, so the file holds nu <= cut only
+    U256 c = o.acnt, m1 = o.am1, m2 = o.am2;
+    for (long long v = 0; v <= o.cap; ++v) {
+        if (!(o.bins[v].lo || o.bins[v].hi)) continue;
+        if (o.cut < 0 || v <= o.cut) {
+            std::cout << v << " " << u256s(o.bins[v]) << "\n";
+        } else {
+            add256(c, o.bins[v]);
+            add256(m1, mul_small(o.bins[v], uint64_t(v)));
+            add256(m2, mul_small(mul_small(o.bins[v], uint64_t(v)), uint64_t(v)));
+        }
+    }
+    if (c.lo || c.hi)
+        std::cout << "# above " << o.cut << " " << u256s(c) << " " << u256s(m1) << " " << u256s(m2) << "\n";
+}
+
 static std::map<int, u128> brute(std::vector<int> const& primes) {
     int64_t M = 1;
     int T = 1;
@@ -909,6 +1255,10 @@ int main(int argc, char** argv) {
         else if (a == "--stream") STREAM = std::stoi(argv[++i]);
         else if (a == "/") groups.emplace_back();
         else if (a == "--hier") HIER = true;
+        else if (a == "--hier2") HIER2 = true;
+        else if (a == "--sigma-cache") SIGMA_CACHE = argv[++i];
+        else if (a == "--cut") CUT = std::stoll(argv[++i]);
+        else if (a == "--cap") CAP = std::stoll(argv[++i]);
         else if (a == "--raw-limit") RAW_LIMIT = std::stoull(argv[++i]);
         else if (a == "--sigma-limit") SIGMA_LIMIT = std::stoull(argv[++i]);
         else if (a == "|") { agroups_start = groups.size(); groups.emplace_back(); }
@@ -979,9 +1329,54 @@ int main(int argc, char** argv) {
                 if (u256s(z) != "1219326311370217861743636654061881000000000000000000000")
                     throw std::runtime_error("u256 product self-test failed: " + u256s(z));
             }
+            {
+                // hier2 against hier: no cut -> identical bins; cut -> identical bins up to the cut and
+                // the aggregate equal to count, sum nu, sum nu^2 of the bins above it
+                AFFINE_MAX = 420; FUSE = 2;
+                for (int t : {1, 2}) {
+                    THREADS = t;
+                    std::vector<std::vector<int>> B{{3, 7, 5, 13}, {73, 19}, {17}}, A{{29, 43}, {23}, {53}};
+                    std::vector<std::vector<int>> B2{{3, 7}, {31, 11}, {37}}, A2{{29}, {8191, 53}, {137}};
+                    for (auto const& [BB, AA] : {std::pair{B, A}, std::pair{B2, A2}}) {
+                        auto ref = hier_run(BB, AA, false).h256;
+                        Out2 o = hier2_run(BB, AA, "", -1, 0, false);
+                        for (long long v = 0; v <= o.cap; ++v) {
+                            auto it = ref.find(int(v));
+                            U256 r = it == ref.end() ? U256{} : it->second;
+                            if (!(r == o.bins[v])) throw std::runtime_error("hier2 self-test: bins differ");
+                        }
+                        for (long long cut : {o.T / 50, o.T / 7, o.T / 3}) {
+                            Out2 c = hier2_run(BB, AA, "", cut, cut + 3, false);
+                            U256 n0, n1, n2;
+                            for (auto const& [v, cnt] : ref) {
+                                if (v <= cut) {
+                                    if (!(cnt == c.bins[v])) throw std::runtime_error("hier2 self-test: cut bins differ");
+                                } else {
+                                    add256(n0, cnt);
+                                    add256(n1, mul_small(cnt, uint64_t(v)));
+                                    add256(n2, mul_small(mul_small(cnt, uint64_t(v)), uint64_t(v)));
+                                }
+                            }
+                            U256 c0 = c.acnt, c1 = c.am1, c2 = c.am2;
+                            for (long long v = cut + 1; v <= c.cap; ++v) {
+                                add256(c0, c.bins[v]);
+                                add256(c1, mul_small(c.bins[v], uint64_t(v)));
+                                add256(c2, mul_small(mul_small(c.bins[v], uint64_t(v)), uint64_t(v)));
+                            }
+                            if (!(c0 == n0 && c1 == n1 && c2 == n2)) throw std::runtime_error("hier2 self-test: aggregate differs");
+                        }
+                    }
+                }
+            }
             FUSE = f0; THREADS = t0; AFFINE_MAX = a0;
             std::cerr << "dp_seed2 self-test passed\n";
             if (primes.empty()) return 0;
+        }
+        if (HIER2) {
+            std::vector<std::vector<int>> B(groups.begin(), groups.begin() + agroups_start),
+                A(groups.begin() + agroups_start, groups.end());
+            print_out2(hier2_run(B, A, SIGMA_CACHE, CUT, CAP, true));
+            return 0;
         }
         if (HIER) {
             std::vector<std::vector<int>> B(groups.begin(), groups.begin() + agroups_start),

@@ -18,6 +18,7 @@ log 2 is replaced by a rational lower bound, which only increases the sum.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import sys
@@ -96,7 +97,10 @@ def atoms(clusters: dict[int, list[int]]) -> list[tuple[int, int]]:
 
 
 def upper_sum(hist: dict[int, int], base: list[int], clusters: dict[int, list[int]],
-              split: int | None = None, terms: int = 40) -> Fraction:
+              split: int | None = None, terms: int = 40, above: tuple | None = None) -> Fraction:
+    """above = (cut, count, sum nu, sum nu^2) for base classes that the generator did not bin,
+    all with nu > cut. They count as trivial terms, which is exact once (cut + 1) * m_min >= thr
+    (checked below): then nu * m >= thr for every such nu and every cluster atom m."""
     T0 = 1
     for q in base:
         T0 = lcm(T0, ord2(q))
@@ -108,7 +112,8 @@ def upper_sum(hist: dict[int, int], base: list[int], clusters: dict[int, list[in
         require(gcd(d, T0) == 1, f"cluster order {d} shares a factor with T0={T0}")
         for e in ds[i + 1:]:
             require(gcd(d, e) == 1, f"cluster orders {d}, {e} not coprime")
-    require(sum(hist.values()) == prod(base), "seed histogram total != prod(base)")
+    acnt = above[1] if above else 0
+    require(sum(hist.values()) + acnt == prod(base), "seed histogram total != prod(base)")
     require(all(0 <= nu <= T0 for nu in hist), "nu out of range")
 
     M = prod(allp)
@@ -149,6 +154,10 @@ def upper_sum(hist: dict[int, int], base: list[int], clusters: dict[int, list[in
             i = bisect_right(f2, tn // (td * k))
             small += delta * w1 * k * pwm[i]
             large += delta * w1 * (pw[-1] - pw[i])
+    if above:
+        m_min = min(m for m, _ in A1) * f2[0]
+        require((above[0] + 1) * m_min * td >= tn, "aggregate cut is below the trivial regime")
+        large += acnt * sum(w for _, w in A1) * pw[-1]
     return Fraction(small, T * phi) / l2 + Fraction(large, 2 * M)
 
 
@@ -187,36 +196,105 @@ def self_test() -> None:
     require(got == direct_sum([3, 5, 7, 23]), "upper_sum != direct enumeration")
     for s in range(3):
         require(upper_sum(seed_brute(base), base, cl, split=s) == got, "split changes sum")
+    # aggregated tail: bins above a cut in the trivial regime replaced by (count, sum nu, sum nu^2)
+    base, cl = [3, 5, 7, 13], {11: [23], 23: [47]}
+    h = seed_brute(base)
+    full = upper_sum(h, base, cl)
+    allp = base + [23, 47]
+    thr = Fraction(lcm(*(ord2(q) for q in allp)) * prod(q - 1 for q in allp), 2 * prod(allp)) * log2_lower(40)
+    m_min = min(cluster_poly(11, [23])) * min(cluster_poly(23, [47]))
+    cut = -(-thr.numerator // (thr.denominator * m_min)) - 1  # least cut with (cut+1) m_min >= thr
+    require(0 <= cut < max(h), "aggregate self-test needs a cut inside the histogram")
+
+    def squash(c: int):
+        keep = {v: n for v, n in h.items() if v <= c}
+        tail = [(v, n) for v, n in h.items() if v > c]
+        return keep, (c, sum(n for _, n in tail), sum(n * v for v, n in tail), sum(n * v * v for v, n in tail))
+
+    keep, agg = squash(cut)
+    require(upper_sum(keep, base, cl, above=agg) == full, "aggregate changes sum")
+    check_moments(keep, base, above=agg, quiet=True)
+    keep, agg = squash(cut - 1)
+    try:
+        upper_sum(keep, base, cl, above=agg)
+        require(False, "a cut below the trivial regime was accepted")
+    except ValueError as e:
+        require("trivial regime" in str(e), str(e))
+    # divisor form of the second moment equals the plain sum over k
+    for b in ([3, 5, 7, 13], [3, 5, 17, 31]):
+        T0 = lcm(*(ord2(q) for q in b))
+        ds = [(q, ord2(q)) for q in b]
+        require(second_moment(b) == T0 * sum(prod(q - 2 + (k % d == 0) for q, d in ds) for k in range(T0)),
+                "divisor form of the second moment")
     require(Fraction(69, 100) < log2_lower(40) < Fraction(70, 100), "log 2 bound")
     print("verifier self-tests passed", file=sys.stderr)
 
 
-def check_moments(hist: dict[int, int], base: list[int]) -> None:
+def second_moment(base: list[int]) -> int:
+    """T0 * sum_{k mod T0} prod_q (q - 2 + [ord_q(2) | k]), summed over g = gcd(k, T0): the
+    product only depends on which orders divide k, i.e. on g, and phi(T0/g) values of k have it."""
+    T0 = lcm(*(ord2(q) for q in base))
+    ds = [(q, ord2(q)) for q in base]
+    fac = {}
+    n = T0
+    p = 2
+    while p * p <= n:
+        while n % p == 0:
+            fac[p] = fac.get(p, 0) + 1
+            n //= p
+        p += 1
+    if n > 1:
+        fac[n] = fac.get(n, 0) + 1
+    divs = [1]
+    for p, e in fac.items():
+        divs = [d * p ** i for d in divs for i in range(e + 1)]
+
+    def phi(m: int) -> int:
+        r = m
+        for p in fac:
+            if m % p == 0:
+                r -= r // p
+        return r
+
+    return T0 * sum(phi(T0 // gg) * prod(q - 2 + (gg % d == 0) for q, d in ds) for gg in divs)
+
+
+def check_moments(hist: dict[int, int], base: list[int], above: tuple | None = None,
+                  quiet: bool = False) -> None:
     """Independent check of the seed histogram (does not use the DP): its first two
     moments must equal the ones computed straight from the residue conditions,
         sum delta(nu) nu   = T0 prod (q-1),
         sum delta(nu) nu^2 = T0 sum_{k mod T0} prod_q (q - 2 + [ord_q(2) | k]),
-    since a pair of exponents r, r+k is blocked by q at 2 residues, or 1 if ord_q | k."""
-    T0 = 1
-    for q in base:
-        T0 = lcm(T0, ord2(q))
-    ds = [(q, ord2(q)) for q in base]
-    m1 = sum(c * nu for nu, c in hist.items())
+    since a pair of exponents r, r+k is blocked by q at 2 residues, or 1 if ord_q | k.
+    An aggregated tail contributes its own count, sum nu and sum nu^2."""
+    T0 = lcm(*(ord2(q) for q in base))
+    a = above or (0, 0, 0, 0)
+    require(sum(hist.values()) + a[1] == prod(base), "seed histogram total is wrong")
+    m1 = sum(c * nu for nu, c in hist.items()) + a[2]
     require(m1 == T0 * prod(q - 1 for q in base), "first moment of seed histogram is wrong")
-    m2 = sum(c * nu * nu for nu, c in hist.items())
-    ref = T0 * sum(prod(q - 2 + (k % d == 0) for q, d in ds) for k in range(T0))
-    require(m2 == ref, "second moment of seed histogram is wrong")
-    print("seed histogram moments 1 and 2 match the residue conditions", file=sys.stderr)
+    m2 = sum(c * nu * nu for nu, c in hist.items()) + a[3]
+    require(m2 == second_moment(base), "second moment of seed histogram is wrong")
+    if above:
+        require(a[2] > a[0] * a[1] and a[3] > a[0] * a[2], "aggregate moments inconsistent with nu > cut")
+    if not quiet:
+        print("seed histogram moments 1 and 2 match the residue conditions", file=sys.stderr)
 
 
-def load_hist(path: Path) -> dict[int, int]:
+def load_hist(path: Path) -> tuple[dict[int, int], tuple | None]:
+    """Lines 'nu count'; optionally one line '# above CUT count sum_nu sum_nu2'. May be gzipped."""
     h: dict[int, int] = {}
-    for line in path.read_text().splitlines():
-        if line.strip():
+    above = None
+    text = gzip.decompress(path.read_bytes()).decode() if path.suffix == ".gz" else path.read_text()
+    for line in text.splitlines():
+        if line.startswith("# above "):
+            require(above is None, "two aggregate lines")
+            above = tuple(map(int, line.split()[2:]))
+            require(len(above) == 4 and above[0] >= 0 and above[1] > 0, f"bad aggregate line {line!r}")
+        elif line.strip():
             nu, c = map(int, line.split())
             require(nu not in h and c > 0, f"bad histogram line {line!r}")
             h[nu] = c
-    return h
+    return h, above
 
 
 def dec(f: Fraction, prec: int = 60) -> Decimal:
@@ -237,9 +315,10 @@ def main() -> int:
     cert = json.loads(a.cert.read_text())
     base = cert["base_order"]
     clusters = {int(d): qs for d, qs in cert["clusters"].items()}
-    hist = load_hist(a.seed)
-    check_moments(hist, base)
-    S = upper_sum(hist, base, clusters)
+    raw = gzip.decompress(a.seed.read_bytes()) if a.seed.suffix == ".gz" else a.seed.read_bytes()
+    hist, above = load_hist(a.seed)
+    check_moments(hist, base, above)
+    S = upper_sum(hist, base, clusters, above=above)
     allp = sorted(base + [q for qs in clusters.values() for q in qs])
     T = 1
     for q in allp:
@@ -255,8 +334,9 @@ def main() -> int:
         f"M = {prod(allp)}",
         f"phi(M) = {prod(q - 1 for q in allp)}",
         f"T = {T}",
-        f"seed histogram sha256 = {hashlib.sha256(a.seed.read_bytes()).hexdigest()}",
-        f"seed histogram entries = {len(hist)}",
+        f"seed histogram sha256 = {hashlib.sha256(raw).hexdigest()}",
+        f"seed histogram entries = {len(hist)}" + (
+            f" + aggregate of {above[1]} classes with nu > {above[0]}" if above else ""),
         f"rational upper sum = {dec(S, 100)}",
         f"proved: upper density < {dec(shown, 16)}",
         f"improvement over {a.previous} = {dec(prev - S, 30)}",
